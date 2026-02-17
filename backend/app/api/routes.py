@@ -555,3 +555,221 @@ def parse_document_structure(markdown: str) -> list[dict]:
         elements.append({"type": elem_type, "content": '\n'.join(current_para)})
     
     return elements
+
+
+# ============ Chart/Graph Data Extraction ============
+
+@router.post("/extract/chart")
+async def extract_chart(file: UploadFile = File(...)):
+    """
+    Extract data from a chart or graph image.
+    
+    Supports: bar charts, line graphs, pie charts, scatter plots.
+    Uses vision AI to read values from the visualization.
+    
+    Returns structured data that can be re-plotted or analyzed.
+    """
+    from app.services.chart_extractor import extract_chart_data
+    
+    job_id = str(uuid.uuid4())[:8]
+    upload_path = settings.upload_dir / f"{job_id}_{file.filename}"
+    
+    async with aiofiles.open(upload_path, 'wb') as f:
+        content = await file.read()
+        await f.write(content)
+    
+    try:
+        result = await extract_chart_data(str(upload_path))
+        return {
+            "filename": file.filename,
+            "chart_type": result.get("chart_type", "unknown"),
+            "title": result.get("title"),
+            "data": result.get("data", []),
+            "x_axis": result.get("x_axis"),
+            "y_axis": result.get("y_axis"),
+            "legend": result.get("legend", []),
+            "insights": result.get("insights", [])
+        }
+    finally:
+        upload_path.unlink(missing_ok=True)
+
+
+@router.post("/extract/diagram")
+async def extract_diagram(file: UploadFile = File(...)):
+    """
+    Extract information from diagrams and schematics.
+    
+    Supports: flowcharts, circuit diagrams, org charts, architecture diagrams, UML.
+    
+    Returns components, connections, and structure.
+    """
+    from app.services.chart_extractor import extract_diagram_info
+    
+    job_id = str(uuid.uuid4())[:8]
+    upload_path = settings.upload_dir / f"{job_id}_{file.filename}"
+    
+    async with aiofiles.open(upload_path, 'wb') as f:
+        content = await file.read()
+        await f.write(content)
+    
+    try:
+        result = await extract_diagram_info(str(upload_path))
+        return {
+            "filename": file.filename,
+            **result
+        }
+    finally:
+        upload_path.unlink(missing_ok=True)
+
+
+# ============ Document Comparison ============
+
+@router.post("/compare")
+async def compare_documents(
+    file1: UploadFile = File(...),
+    file2: UploadFile = File(...)
+):
+    """
+    Compare two documents and show differences.
+    
+    Returns:
+    - Similarity percentage
+    - Added/removed/changed lines
+    - Side-by-side diff
+    """
+    from app.services.document_compare import compare_documents as do_compare, generate_html_diff
+    
+    # Extract text from both documents
+    extractor = get_extractor()
+    
+    job_id1 = str(uuid.uuid4())[:8]
+    job_id2 = str(uuid.uuid4())[:8]
+    path1 = settings.upload_dir / f"{job_id1}_{file1.filename}"
+    path2 = settings.upload_dir / f"{job_id2}_{file2.filename}"
+    
+    async with aiofiles.open(path1, 'wb') as f:
+        await f.write(await file1.read())
+    async with aiofiles.open(path2, 'wb') as f:
+        await f.write(await file2.read())
+    
+    try:
+        result1 = await extractor.extract(path1, extract_images=False)
+        result2 = await extractor.extract(path2, extract_images=False)
+        
+        comparison = do_compare(
+            result1.text,
+            result2.text,
+            doc1_name=file1.filename,
+            doc2_name=file2.filename
+        )
+        
+        html_diff = generate_html_diff(
+            result1.text,
+            result2.text,
+            doc1_name=file1.filename,
+            doc2_name=file2.filename
+        )
+        
+        return {
+            "doc1": file1.filename,
+            "doc2": file2.filename,
+            "similarity_percent": comparison.similarity_percent,
+            "total_lines_doc1": comparison.total_lines_doc1,
+            "total_lines_doc2": comparison.total_lines_doc2,
+            "added_lines": comparison.added_lines,
+            "removed_lines": comparison.removed_lines,
+            "summary": comparison.summary,
+            "diffs": [
+                {"type": d.type.value, "line": d.line_number, "content": d.content}
+                for d in comparison.diffs[:100]  # Limit to first 100 diffs
+            ],
+            "html_diff": html_diff
+        }
+    finally:
+        path1.unlink(missing_ok=True)
+        path2.unlink(missing_ok=True)
+
+
+# ============ OCR Quality & Correction ============
+
+@router.post("/ocr/analyze")
+async def analyze_ocr_quality(file: UploadFile = File(...)):
+    """
+    Analyze OCR quality of extracted text.
+    
+    Returns:
+    - Confidence score
+    - Potential issues detected
+    - Quality rating (high/medium/low)
+    """
+    from app.services.ocr_correction import calculate_ocr_confidence
+    
+    job_id = str(uuid.uuid4())[:8]
+    upload_path = settings.upload_dir / f"{job_id}_{file.filename}"
+    
+    async with aiofiles.open(upload_path, 'wb') as f:
+        content = await file.read()
+        await f.write(content)
+    
+    try:
+        extractor = get_extractor()
+        result = await extractor.extract(upload_path, extract_images=False)
+        
+        quality = calculate_ocr_confidence(result.text)
+        
+        return {
+            "filename": file.filename,
+            **quality
+        }
+    finally:
+        upload_path.unlink(missing_ok=True)
+
+
+@router.post("/ocr/correct")
+async def correct_ocr_errors(
+    file: UploadFile = File(...),
+    language: str = "en"
+):
+    """
+    Fix OCR errors using AI.
+    
+    Corrects:
+    - Character confusions (0/O, 1/l/I, etc.)
+    - Word boundary issues
+    - Context-appropriate fixes
+    
+    Returns corrected text and list of changes made.
+    """
+    from app.services.ocr_correction import smart_fix_ocr, calculate_ocr_confidence
+    
+    job_id = str(uuid.uuid4())[:8]
+    upload_path = settings.upload_dir / f"{job_id}_{file.filename}"
+    
+    async with aiofiles.open(upload_path, 'wb') as f:
+        content = await file.read()
+        await f.write(content)
+    
+    try:
+        extractor = get_extractor()
+        result = await extractor.extract(upload_path, extract_images=False)
+        
+        # Analyze original quality
+        original_quality = calculate_ocr_confidence(result.text)
+        
+        # Correct errors
+        correction = await smart_fix_ocr(result.text, language=language)
+        
+        # Analyze corrected quality
+        corrected_quality = calculate_ocr_confidence(correction.get("corrected_text", result.text))
+        
+        return {
+            "filename": file.filename,
+            "original_quality": original_quality,
+            "corrected_quality": corrected_quality,
+            "corrected_text": correction.get("corrected_text"),
+            "corrections": correction.get("corrections", []),
+            "confidence": correction.get("overall_confidence", correction.get("confidence")),
+            "method": correction.get("method", "unknown")
+        }
+    finally:
+        upload_path.unlink(missing_ok=True)
