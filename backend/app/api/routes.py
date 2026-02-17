@@ -1,13 +1,18 @@
 import uuid
+import asyncio
 import aiofiles
+import zipfile
+import io
 from pathlib import Path
-from typing import Optional
-from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks
-from fastapi.responses import FileResponse, JSONResponse
+from typing import Optional, List
+from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks, Form
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from app.config import get_settings
 from app.services.extractor import get_extractor, OutputFormat
+from app.services.languages import get_supported_languages, detect_language
+from app.services.summarizer import create_concise_summary, extract_structured_data
 
 settings = get_settings()
 router = APIRouter()
@@ -216,3 +221,337 @@ async def cleanup_file(path: Path):
         path.unlink(missing_ok=True)
     except:
         pass
+
+
+# ============ Languages ============
+
+@router.get("/languages")
+async def list_languages():
+    """List supported OCR languages."""
+    return get_supported_languages()
+
+
+# ============ AI Summary ============
+
+@router.post("/extract/summarize")
+async def extract_with_summary(
+    file: UploadFile = File(...),
+    language: str = "en",
+    max_bullets: int = 15
+):
+    """
+    Extract content AND create a concise, itemized summary.
+    
+    Returns:
+    - Standard extraction (markdown, text, tables)
+    - AI-generated summary with key points
+    - Important numbers and figures
+    """
+    # First do standard extraction
+    file.file.seek(0, 2)
+    size_mb = file.file.tell() / (1024 * 1024)
+    file.file.seek(0)
+    
+    if size_mb > settings.max_file_size_mb:
+        raise HTTPException(status_code=413, detail=f"File too large")
+    
+    job_id = str(uuid.uuid4())[:8]
+    upload_path = settings.upload_dir / f"{job_id}_{file.filename}"
+    
+    async with aiofiles.open(upload_path, 'wb') as f:
+        content = await file.read()
+        await f.write(content)
+    
+    try:
+        extractor = get_extractor()
+        result = await extractor.extract(file_path=upload_path, extract_images=False)
+        
+        # Create AI summary
+        tables_data = [{"index": t.index, "markdown": t.markdown} for t in result.tables]
+        summary = await create_concise_summary(
+            result.markdown,
+            tables_data,
+            result.num_pages,
+            max_bullets
+        )
+        
+        # Detect language if not specified
+        detected_lang = detect_language(result.text[:1000]) if result.text else language
+        
+        return {
+            "filename": result.filename,
+            "num_pages": result.num_pages,
+            "language_detected": detected_lang,
+            "summary": summary.get("summary", ""),
+            "key_points": summary.get("key_points", []),
+            "important_numbers": summary.get("important_numbers", []),
+            "figures_mentioned": summary.get("figures_mentioned", []),
+            "tables_summary": summary.get("tables_summary", []),
+            "tables_count": len(result.tables),
+            "markdown": result.markdown,
+            "text": result.text
+        }
+    finally:
+        upload_path.unlink(missing_ok=True)
+
+
+@router.post("/extract/structured")
+async def extract_structured(file: UploadFile = File(...)):
+    """
+    Extract structured data from documents like invoices, forms, receipts.
+    
+    Returns field-value pairs based on document type.
+    """
+    job_id = str(uuid.uuid4())[:8]
+    upload_path = settings.upload_dir / f"{job_id}_{file.filename}"
+    
+    async with aiofiles.open(upload_path, 'wb') as f:
+        content = await file.read()
+        await f.write(content)
+    
+    try:
+        extractor = get_extractor()
+        result = await extractor.extract(file_path=upload_path, extract_images=False)
+        
+        # Extract structured data
+        structured = await extract_structured_data(result.text)
+        
+        return {
+            "filename": result.filename,
+            "document_type": structured.get("document_type", "unknown"),
+            "confidence": structured.get("confidence", 0),
+            "extracted_fields": structured.get("extracted_fields", {}),
+            "line_items": structured.get("line_items", []),
+            "raw_text": result.text[:2000]  # First 2000 chars for reference
+        }
+    finally:
+        upload_path.unlink(missing_ok=True)
+
+
+# ============ Batch Processing ============
+
+@router.post("/extract/batch")
+async def extract_batch(
+    files: List[UploadFile] = File(...),
+    output_format: str = "markdown",
+    extract_images: bool = False
+):
+    """
+    Process multiple documents at once.
+    
+    Returns results for each file or a ZIP with all outputs.
+    """
+    if len(files) > 20:
+        raise HTTPException(status_code=400, detail="Maximum 20 files per batch")
+    
+    results = []
+    
+    for file in files:
+        job_id = str(uuid.uuid4())[:8]
+        upload_path = settings.upload_dir / f"{job_id}_{file.filename}"
+        
+        try:
+            async with aiofiles.open(upload_path, 'wb') as f:
+                content = await file.read()
+                await f.write(content)
+            
+            extractor = get_extractor()
+            result = await extractor.extract(file_path=upload_path, extract_images=False)
+            
+            results.append({
+                "filename": result.filename,
+                "num_pages": result.num_pages,
+                "success": True,
+                "content": result.markdown if output_format == "markdown" else result.text,
+                "tables_count": len(result.tables)
+            })
+        except Exception as e:
+            results.append({
+                "filename": file.filename,
+                "success": False,
+                "error": str(e)
+            })
+        finally:
+            upload_path.unlink(missing_ok=True)
+    
+    return {
+        "total_files": len(files),
+        "successful": sum(1 for r in results if r.get("success")),
+        "failed": sum(1 for r in results if not r.get("success")),
+        "results": results
+    }
+
+
+@router.post("/extract/batch/zip")
+async def extract_batch_to_zip(
+    files: List[UploadFile] = File(...),
+    output_format: str = "markdown"
+):
+    """
+    Process multiple documents and return a ZIP file with all outputs.
+    """
+    if len(files) > 20:
+        raise HTTPException(status_code=400, detail="Maximum 20 files per batch")
+    
+    # Create in-memory ZIP
+    zip_buffer = io.BytesIO()
+    
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+        for file in files:
+            job_id = str(uuid.uuid4())[:8]
+            upload_path = settings.upload_dir / f"{job_id}_{file.filename}"
+            
+            try:
+                async with aiofiles.open(upload_path, 'wb') as f:
+                    content = await file.read()
+                    await f.write(content)
+                
+                extractor = get_extractor()
+                result = await extractor.extract(file_path=upload_path, extract_images=False)
+                
+                # Add to ZIP
+                base_name = Path(file.filename).stem
+                
+                if output_format == "markdown":
+                    zip_file.writestr(f"{base_name}.md", result.markdown)
+                elif output_format == "text":
+                    zip_file.writestr(f"{base_name}.txt", result.text)
+                elif output_format == "json":
+                    import json
+                    data = {
+                        "filename": result.filename,
+                        "num_pages": result.num_pages,
+                        "markdown": result.markdown,
+                        "text": result.text,
+                        "tables": [{"markdown": t.markdown, "csv": t.csv} for t in result.tables],
+                        "headings": result.headings
+                    }
+                    zip_file.writestr(f"{base_name}.json", json.dumps(data, indent=2))
+                
+                # Add tables as CSV
+                for i, table in enumerate(result.tables):
+                    if table.csv:
+                        zip_file.writestr(f"{base_name}_table_{i+1}.csv", table.csv)
+                        
+            except Exception as e:
+                zip_file.writestr(f"{Path(file.filename).stem}_error.txt", f"Error: {str(e)}")
+            finally:
+                upload_path.unlink(missing_ok=True)
+    
+    zip_buffer.seek(0)
+    
+    return StreamingResponse(
+        zip_buffer,
+        media_type="application/zip",
+        headers={"Content-Disposition": "attachment; filename=extracted_documents.zip"}
+    )
+
+
+# ============ Paragraph Structure ============
+
+@router.post("/extract/structure")
+async def extract_with_structure(file: UploadFile = File(...)):
+    """
+    Extract with detailed paragraph structure.
+    
+    Identifies:
+    - Headings (H1-H6)
+    - Paragraphs
+    - Lists (bullet, numbered)
+    - Code blocks
+    - Quotes
+    """
+    job_id = str(uuid.uuid4())[:8]
+    upload_path = settings.upload_dir / f"{job_id}_{file.filename}"
+    
+    async with aiofiles.open(upload_path, 'wb') as f:
+        content = await file.read()
+        await f.write(content)
+    
+    try:
+        extractor = get_extractor()
+        result = await extractor.extract(file_path=upload_path, extract_images=False)
+        
+        # Parse markdown to identify structure
+        structure = parse_document_structure(result.markdown)
+        
+        return {
+            "filename": result.filename,
+            "num_pages": result.num_pages,
+            "structure": structure,
+            "headings": result.headings,
+            "markdown": result.markdown
+        }
+    finally:
+        upload_path.unlink(missing_ok=True)
+
+
+def parse_document_structure(markdown: str) -> list[dict]:
+    """Parse markdown into structural elements."""
+    import re
+    
+    elements = []
+    lines = markdown.split('\n')
+    current_para = []
+    in_code_block = False
+    in_list = False
+    
+    for i, line in enumerate(lines):
+        # Code blocks
+        if line.startswith('```'):
+            if in_code_block:
+                elements.append({"type": "code_block", "content": '\n'.join(current_para)})
+                current_para = []
+                in_code_block = False
+            else:
+                if current_para:
+                    elements.append({"type": "paragraph", "content": '\n'.join(current_para)})
+                    current_para = []
+                in_code_block = True
+            continue
+        
+        if in_code_block:
+            current_para.append(line)
+            continue
+        
+        # Headings
+        heading_match = re.match(r'^(#{1,6})\s+(.+)$', line)
+        if heading_match:
+            if current_para:
+                elements.append({"type": "paragraph", "content": '\n'.join(current_para)})
+                current_para = []
+            level = len(heading_match.group(1))
+            elements.append({"type": f"heading_{level}", "content": heading_match.group(2)})
+            continue
+        
+        # Lists
+        list_match = re.match(r'^[\s]*[-*+]\s+(.+)$', line) or re.match(r'^[\s]*\d+\.\s+(.+)$', line)
+        if list_match:
+            if current_para and not in_list:
+                elements.append({"type": "paragraph", "content": '\n'.join(current_para)})
+                current_para = []
+            in_list = True
+            current_para.append(line)
+            continue
+        
+        if in_list and line.strip() == '':
+            elements.append({"type": "list", "content": '\n'.join(current_para)})
+            current_para = []
+            in_list = False
+            continue
+        
+        # Regular paragraphs
+        if line.strip():
+            current_para.append(line)
+        elif current_para:
+            elem_type = "list" if in_list else "paragraph"
+            elements.append({"type": elem_type, "content": '\n'.join(current_para)})
+            current_para = []
+            in_list = False
+    
+    # Final element
+    if current_para:
+        elem_type = "list" if in_list else "paragraph"
+        elements.append({"type": elem_type, "content": '\n'.join(current_para)})
+    
+    return elements

@@ -18,12 +18,48 @@
   }
   
   let file: File | null = null;
+  let files: FileList | null = null;  // For batch
   let url = '';
   let isLoading = false;
   let error = '';
   let result: ExtractionResult | null = null;
+  let summaryResult: SummaryResult | null = null;
   let activeTab = 'markdown';
   let extractImages = true;
+  let enableSummary = false;
+  let selectedLanguage = 'en';
+  let isBatchMode = false;
+  let batchResults: BatchResult[] = [];
+  
+  interface SummaryResult {
+    summary: string;
+    key_points: string[];
+    important_numbers: { value: string; context: string }[];
+    tables_summary: { title: string; key_data: string[] }[];
+  }
+  
+  interface BatchResult {
+    filename: string;
+    success: boolean;
+    num_pages?: number;
+    tables_count?: number;
+    error?: string;
+  }
+  
+  let languages = [
+    { code: 'en', name: 'English' },
+    { code: 'es', name: 'Spanish' },
+    { code: 'fr', name: 'French' },
+    { code: 'de', name: 'German' },
+    { code: 'zh', name: 'Chinese' },
+    { code: 'ja', name: 'Japanese' },
+    { code: 'ko', name: 'Korean' },
+    { code: 'ar', name: 'Arabic' },
+    { code: 'ru', name: 'Russian' },
+    { code: 'pt', name: 'Portuguese' },
+    { code: 'hi', name: 'Hindi' },
+    { code: 'it', name: 'Italian' },
+  ];
   
   function handleFileSelect(event: Event) {
     const input = event.target as HTMLInputElement;
@@ -51,15 +87,23 @@
     isLoading = true;
     error = '';
     result = null;
+    summaryResult = null;
     
     try {
       let response: Response;
+      const endpoint = enableSummary ? '/api/extract/summarize' : '/api/extract';
       
       if (file) {
         const formData = new FormData();
         formData.append('file', file);
         
-        response = await fetch(`/api/extract?extract_images=${extractImages}`, {
+        const params = new URLSearchParams();
+        params.append('extract_images', extractImages.toString());
+        if (enableSummary) {
+          params.append('language', selectedLanguage);
+        }
+        
+        response = await fetch(`${endpoint}?${params}`, {
           method: 'POST',
           body: formData
         });
@@ -74,9 +118,92 @@
         throw new Error(err.detail || 'Extraction failed');
       }
       
-      result = await response.json();
+      const data = await response.json();
+      
+      if (enableSummary) {
+        summaryResult = {
+          summary: data.summary,
+          key_points: data.key_points || [],
+          important_numbers: data.important_numbers || [],
+          tables_summary: data.tables_summary || []
+        };
+        result = {
+          filename: data.filename,
+          num_pages: data.num_pages,
+          markdown: data.markdown,
+          text: data.text,
+          tables: [],
+          images_extracted: 0,
+          title: null,
+          headings: []
+        };
+      } else {
+        result = data;
+      }
     } catch (e) {
       error = e instanceof Error ? e.message : 'Unknown error';
+    } finally {
+      isLoading = false;
+    }
+  }
+  
+  async function extractBatch() {
+    if (!files || files.length === 0) return;
+    
+    isLoading = true;
+    error = '';
+    batchResults = [];
+    
+    try {
+      const formData = new FormData();
+      for (let i = 0; i < files.length; i++) {
+        formData.append('files', files[i]);
+      }
+      
+      const response = await fetch('/api/extract/batch?output_format=markdown', {
+        method: 'POST',
+        body: formData
+      });
+      
+      if (!response.ok) {
+        throw new Error('Batch extraction failed');
+      }
+      
+      const data = await response.json();
+      batchResults = data.results;
+    } catch (e) {
+      error = e instanceof Error ? e.message : 'Batch failed';
+    } finally {
+      isLoading = false;
+    }
+  }
+  
+  async function downloadBatchZip() {
+    if (!files || files.length === 0) return;
+    
+    isLoading = true;
+    
+    try {
+      const formData = new FormData();
+      for (let i = 0; i < files.length; i++) {
+        formData.append('files', files[i]);
+      }
+      
+      const response = await fetch('/api/extract/batch/zip?output_format=markdown', {
+        method: 'POST',
+        body: formData
+      });
+      
+      if (!response.ok) throw new Error('Failed to create ZIP');
+      
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'extracted_documents.zip';
+      a.click();
+    } catch (e) {
+      error = e instanceof Error ? e.message : 'Download failed';
     } finally {
       isLoading = false;
     }
@@ -180,15 +307,66 @@
       </div>
       
       <!-- Options -->
-      <div class="mt-6 flex items-center">
-        <label class="flex items-center cursor-pointer">
-          <input 
-            type="checkbox" 
-            bind:checked={extractImages}
-            class="rounded border-gray-300 text-indigo-600 mr-2"
-          />
-          <span class="text-sm text-gray-700">Extract images</span>
-        </label>
+      <div class="mt-6 space-y-4">
+        <!-- Mode Toggle -->
+        <div class="flex gap-4">
+          <button
+            onclick={() => isBatchMode = false}
+            class="px-4 py-2 rounded-lg text-sm {!isBatchMode ? 'bg-indigo-100 text-indigo-700' : 'bg-gray-100 text-gray-600'}"
+          >
+            Single File
+          </button>
+          <button
+            onclick={() => isBatchMode = true}
+            class="px-4 py-2 rounded-lg text-sm {isBatchMode ? 'bg-indigo-100 text-indigo-700' : 'bg-gray-100 text-gray-600'}"
+          >
+            📦 Batch (up to 20)
+          </button>
+        </div>
+        
+        {#if isBatchMode}
+          <div class="bg-indigo-50 rounded-lg p-4">
+            <input 
+              type="file" 
+              multiple
+              accept=".pdf,.docx,.pptx,.html,.htm,.png,.jpg,.jpeg"
+              onchange={(e) => files = e.target.files}
+              class="w-full"
+            />
+            <p class="text-sm text-indigo-600 mt-2">
+              {files ? `${files.length} files selected` : 'Select multiple files'}
+            </p>
+          </div>
+        {:else}
+          <div class="flex flex-wrap gap-4">
+            <label class="flex items-center cursor-pointer">
+              <input 
+                type="checkbox" 
+                bind:checked={extractImages}
+                class="rounded border-gray-300 text-indigo-600 mr-2"
+              />
+              <span class="text-sm text-gray-700">Extract images</span>
+            </label>
+            
+            <label class="flex items-center cursor-pointer">
+              <input 
+                type="checkbox" 
+                bind:checked={enableSummary}
+                class="rounded border-gray-300 text-indigo-600 mr-2"
+              />
+              <span class="text-sm text-gray-700">🤖 AI Summary</span>
+            </label>
+            
+            <div class="flex items-center gap-2">
+              <span class="text-sm text-gray-700">Language:</span>
+              <select bind:value={selectedLanguage} class="text-sm border border-gray-300 rounded px-2 py-1">
+                {#each languages as lang}
+                  <option value={lang.code}>{lang.name}</option>
+                {/each}
+              </select>
+            </div>
+          </div>
+        {/if}
       </div>
       
       {#if error}
@@ -197,23 +375,42 @@
         </div>
       {/if}
       
-      <button
-        onclick={extract}
-        disabled={isLoading || (!file && !url)}
-        class="mt-6 w-full bg-indigo-600 text-white py-3 rounded-lg font-medium hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed transition"
-      >
-        {#if isLoading}
-          <span class="inline-flex items-center">
-            <svg class="animate-spin -ml-1 mr-3 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-              <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
-              <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-            </svg>
-            Extracting...
-          </span>
-        {:else}
-          🚀 Extract Content
-        {/if}
-      </button>
+      {#if isBatchMode}
+        <div class="mt-6 flex gap-3">
+          <button
+            onclick={extractBatch}
+            disabled={isLoading || !files || files.length === 0}
+            class="flex-1 bg-indigo-600 text-white py-3 rounded-lg font-medium hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed transition"
+          >
+            {isLoading ? 'Processing...' : '📊 Extract All'}
+          </button>
+          <button
+            onclick={downloadBatchZip}
+            disabled={isLoading || !files || files.length === 0}
+            class="bg-green-600 text-white py-3 px-6 rounded-lg font-medium hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed transition"
+          >
+            ⬇️ Download ZIP
+          </button>
+        </div>
+      {:else}
+        <button
+          onclick={extract}
+          disabled={isLoading || (!file && !url)}
+          class="mt-6 w-full bg-indigo-600 text-white py-3 rounded-lg font-medium hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed transition"
+        >
+          {#if isLoading}
+            <span class="inline-flex items-center">
+              <svg class="animate-spin -ml-1 mr-3 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+              </svg>
+              Extracting...
+            </span>
+          {:else}
+            🚀 Extract Content
+          {/if}
+        </button>
+      {/if}
     </div>
     
     <!-- Supported Formats -->
@@ -222,6 +419,51 @@
       <p>PDF • DOCX • PPTX • HTML • PNG • JPG • TIFF</p>
     </div>
     
+  {:else if batchResults.length > 0}
+    <!-- Batch Results -->
+    <div class="mb-6 flex items-center justify-between">
+      <div>
+        <h2 class="text-2xl font-bold text-gray-900">Batch Results</h2>
+        <p class="text-gray-600">
+          {batchResults.filter(r => r.success).length} of {batchResults.length} files processed successfully
+        </p>
+      </div>
+      <button
+        onclick={() => { batchResults = []; files = null; }}
+        class="text-gray-600 hover:text-gray-900 flex items-center"
+      >
+        ← Process More
+      </button>
+    </div>
+    
+    <div class="bg-white rounded-lg shadow-sm border border-gray-200 overflow-hidden">
+      <table class="w-full">
+        <thead class="bg-gray-50">
+          <tr>
+            <th class="text-left px-4 py-3 text-sm font-medium text-gray-600">File</th>
+            <th class="text-center px-4 py-3 text-sm font-medium text-gray-600">Status</th>
+            <th class="text-right px-4 py-3 text-sm font-medium text-gray-600">Pages</th>
+            <th class="text-right px-4 py-3 text-sm font-medium text-gray-600">Tables</th>
+          </tr>
+        </thead>
+        <tbody>
+          {#each batchResults as result}
+            <tr class="border-t border-gray-100">
+              <td class="px-4 py-3 font-medium">{result.filename}</td>
+              <td class="px-4 py-3 text-center">
+                {#if result.success}
+                  <span class="text-green-600">✓</span>
+                {:else}
+                  <span class="text-red-600" title={result.error}>✗</span>
+                {/if}
+              </td>
+              <td class="px-4 py-3 text-right text-gray-600">{result.num_pages || '-'}</td>
+              <td class="px-4 py-3 text-right text-gray-600">{result.tables_count || '-'}</td>
+            </tr>
+          {/each}
+        </tbody>
+      </table>
+    </div>
   {:else}
     <!-- Results Section -->
     <div class="mb-6 flex items-center justify-between">
@@ -238,6 +480,39 @@
         ← New Document
       </button>
     </div>
+    
+    <!-- Summary Card (if enabled) -->
+    {#if summaryResult}
+      <div class="bg-gradient-to-r from-indigo-50 to-purple-50 rounded-lg border border-indigo-200 p-6 mb-6">
+        <h3 class="text-lg font-semibold text-indigo-900 mb-3">🤖 AI Summary</h3>
+        <p class="text-gray-700 mb-4">{summaryResult.summary}</p>
+        
+        {#if summaryResult.key_points.length > 0}
+          <div class="mb-4">
+            <h4 class="text-sm font-medium text-indigo-800 mb-2">Key Points:</h4>
+            <ul class="list-disc list-inside space-y-1">
+              {#each summaryResult.key_points as point}
+                <li class="text-gray-700 text-sm">{point}</li>
+              {/each}
+            </ul>
+          </div>
+        {/if}
+        
+        {#if summaryResult.important_numbers.length > 0}
+          <div>
+            <h4 class="text-sm font-medium text-indigo-800 mb-2">Key Numbers:</h4>
+            <div class="flex flex-wrap gap-2">
+              {#each summaryResult.important_numbers as num}
+                <span class="bg-white px-3 py-1 rounded-full text-sm border border-indigo-200">
+                  <span class="font-semibold">{num.value}</span>
+                  <span class="text-gray-500"> — {num.context}</span>
+                </span>
+              {/each}
+            </div>
+          </div>
+        {/if}
+      </div>
+    {/if}
     
     <!-- Tabs -->
     <div class="bg-white rounded-lg shadow-sm border border-gray-200 overflow-hidden">

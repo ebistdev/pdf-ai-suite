@@ -12,6 +12,12 @@ class Settings(BaseSettings):
     # Processing
     enable_ocr: bool = True
     default_output_format: str = "markdown"  # markdown, json, html, text
+    default_language: str = "en"
+    
+    # AI Enhancement
+    anthropic_api_key: str = ""
+    openai_api_key: str = ""
+    enable_ai_summary: bool = True
     
     # Redis (for job queue)
     redis_url: str = "redis://localhost:6379/0"
